@@ -396,6 +396,11 @@ rasterize_to_pixels_3dgs_bwd(
     // gradients of outputs
     const at::Tensor &v_render_colors, // [..., image_height, image_width, 3]
     const at::Tensor &v_render_alphas, // [..., image_height, image_width, 1]
+    // 3D guard mask inputs (optional)
+    const at::optional<at::Tensor> &depths,       // [..., N] or [nnz]
+    const at::optional<at::Tensor> &render_depth, // [..., H, W, 1]
+    const at::optional<at::Tensor> &gt_mask,      // [..., H, W]
+    const at::optional<at::Tensor> &gaussian_object_ids, // [..., N] or [nnz]
     // options
     bool absgrad
 );

@@ -243,6 +243,27 @@ class Config:
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
+    # Enable semantic loss. (experimental)
+    semantic_loss: bool = False
+    # Weight for semantic loss
+    semantic_lambda: float = 0.1
+    # Per-Gaussian semantic embedding dimension
+    emb_dim: int = 8
+    # Learning rate for the per-Gaussian semantic embeddings
+    emb_lr: float = 2.5e-3
+    # Learning rate for the semantic codebook
+    codebook_lr: float = 5e-3
+    # Number of instance classes (codebook size). Instance ids must be < this value.
+    num_classes: int = 16
+    # Enable the 3D Guard Mask: in the backward pass, suppress semantic-feature
+    # and opacity gradients of Gaussians occluded behind the rendered surface at
+    # foreground (object) pixels. Requires semantic_loss. (experimental)
+    guard_mask: bool = False
+    # Warmup for the 3D Guard Mask: only activate the guard once the iteration
+    # reaches this step, letting geometry and semantics stabilize first so the
+    # depth-based occlusion test doesn't misfire on an unconverged scene.
+    guard_warmup: int = 15000
+
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
@@ -298,6 +319,8 @@ def create_splats_with_optimizers(
     visible_adam: bool = False,
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
+    emb_dim: Optional[int] = None,
+    emb_lr: float = 2.5e-3,
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
@@ -345,6 +368,13 @@ def create_splats_with_optimizers(
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
         colors = torch.logit(rgbs)  # [N, 3]
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+
+    if emb_dim is not None:
+        # Per-Gaussian semantic embedding, rendered into a 2D feature map and
+        # matched against a learnable codebook to predict per-pixel instance ids.
+        # This key is densified generically alongside the other splat params.
+        embeddings = torch.randn(N, emb_dim) * 0.1  # [N, emb_dim]
+        params.append(("embeddings", torch.nn.Parameter(embeddings), emb_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -447,6 +477,7 @@ class Runner:
                 split="train",
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
+                load_semantics=cfg.semantic_loss,
             )
             self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -473,6 +504,7 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
+        emb_dim = cfg.emb_dim if cfg.semantic_loss else None
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -492,6 +524,8 @@ class Runner:
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
+            emb_dim=emb_dim,
+            emb_lr=cfg.emb_lr,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
@@ -565,6 +599,28 @@ class Runner:
             if world_size > 1:
                 self.app_module = DDP(self.app_module)
 
+        # Semantic codebook. The codebook B in R^{num_classes x emb_dim} is a
+        # global (non-per-Gaussian) learnable tensor, so it lives outside `splats`
+        # with its own optimizer -- otherwise densification would wrongly clone it.
+        self.codebook = None
+        self.semantic_optimizers = []
+        if cfg.semantic_loss:
+            max_id = self._scan_max_instance_id()
+            if max_id >= cfg.num_classes:
+                raise ValueError(
+                    f"Found instance id {max_id} in semantics, but num_classes="
+                    f"{cfg.num_classes}. Increase Config.num_classes."
+                )
+            self.codebook = torch.nn.Parameter(
+                torch.randn(cfg.num_classes, cfg.emb_dim, device=self.device) * 0.1
+            )
+            self.semantic_optimizers = [
+                torch.optim.Adam(
+                    [self.codebook],
+                    lr=cfg.codebook_lr * math.sqrt(cfg.batch_size),
+                )
+            ]
+
         self.post_processing_module = None
         if cfg.post_processing == "bilateral_grid":
             self.post_processing_module = BilateralGrid(
@@ -628,6 +684,62 @@ class Runner:
 
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
+
+    def _scan_max_instance_id(self) -> int:
+        """Scan the training set's semantic label images for the max instance id."""
+        import cv2
+
+        max_id = 0
+        for index in self.trainset.indices:
+            sem_path = self.trainset._semantics_path(self.parser.image_paths[index])
+            sem = cv2.imread(sem_path, cv2.IMREAD_ANYDEPTH)
+            if sem is None:
+                raise FileNotFoundError(f"Semantic label image not found: {sem_path}")
+            max_id = max(max_id, int(sem.max()))
+        return max_id
+
+    def _semantic_palette(self) -> Tensor:
+        """A fixed [num_classes, 3] RGB palette (in [0, 1]) for instance colors."""
+        # Deterministic, well-separated colors via golden-ratio hue spacing.
+        n = self.cfg.num_classes
+        hues = (torch.arange(n, dtype=torch.float32) * 0.61803398875) % 1.0
+        # HSV (s=0.85, v=0.95) -> RGB without external deps.
+        s, v = 0.85, 0.95
+        h6 = hues * 6.0
+        c = v * s
+        x = c * (1.0 - (h6 % 2.0 - 1.0).abs())
+        m = v - c
+        z = torch.zeros_like(hues)
+        i = h6.long() % 6
+        rgb = torch.stack(
+            [
+                torch.where(
+                    i == 0, c, torch.where(i == 1, x, torch.where(i == 2, z, torch.where(i == 3, z, torch.where(i == 4, x, c))))
+                ),
+                torch.where(
+                    i == 0, x, torch.where(i == 1, c, torch.where(i == 2, c, torch.where(i == 3, x, torch.where(i == 4, z, z))))
+                ),
+                torch.where(
+                    i == 0, z, torch.where(i == 1, z, torch.where(i == 2, x, torch.where(i == 3, c, torch.where(i == 4, c, x))))
+                ),
+            ],
+            dim=-1,
+        ) + m
+        return rgb.to(self.device)  # [num_classes, 3]
+
+    def _semantic_colorize(self, emb_map: Tensor) -> Tensor:
+        """Map a rendered embedding map to a colorized argmax label image.
+
+        Args:
+            emb_map: [H, W, emb_dim] rendered 2D feature map (info["render_extra_signals"]).
+        Returns:
+            [H, W, 3] RGB image in [0, 1], colored by the most likely instance id
+            (argmax of softmax(I_emb @ B^T)).
+        """
+        logits = emb_map @ self.codebook.t()  # [H, W, num_classes]
+        labels = logits.argmax(dim=-1)  # [H, W]
+        palette = self._semantic_palette()  # [num_classes, 3]
+        return palette[labels]  # [H, W, 3]
 
     def freeze_gaussians(self):
         """Freeze all Gaussian parameters for controller distillation.
@@ -711,6 +823,21 @@ class Runner:
                     .unsqueeze(0)
                 )
 
+        # Render the per-Gaussian semantic embedding as an extra 2D feature map
+        # (returned in info["render_extra_signals"]); RGB/depth are unaffected.
+        extra_signals = splats["embeddings"] if "embeddings" in splats else None
+
+        # When extra_signals are rendered, rasterization concatenates them onto the
+        # color channels. A caller-supplied background (e.g. the viewer's [C, 3]) only
+        # covers RGB, so pad it with zeros for the extra channels to satisfy the
+        # rasterizer's channel-count check.
+        if extra_signals is not None and kwargs.get("backgrounds") is not None:
+            bkgd = kwargs["backgrounds"]
+            E = extra_signals.shape[-1]
+            kwargs["backgrounds"] = torch.cat(
+                [bkgd, torch.zeros((*bkgd.shape[:-1], E), device=bkgd.device)], dim=-1
+            )
+
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -737,6 +864,7 @@ class Runner:
             radial_coeffs=radial_coeffs,
             tangential_coeffs=tangential_coeffs,
             thin_prism_coeffs=thin_prism_coeffs,
+            extra_signals=extra_signals,
             **kwargs,
         )
         if masks is not None:
@@ -883,8 +1011,15 @@ class Runner:
                 data["exposure"].to(device) if "exposure" in data else None
             )  # [B,]
             if cfg.depth_loss:
-                points = data["points"].to(device)  # [1, M, 2]
-                depths_gt = data["depths"].to(device)  # [1, M]
+                # Support both dense depth maps and sparse depth points
+                if "depth_map" in data:
+                    depth_gt = data["depth_map"].to(device)  # [1, H, W]
+                else:
+                    # Fallback to sparse points
+                    points = data["points"].to(device)  # [1, M, 2]
+                    depths_gt = data["depths"].to(device)  # [1, M]
+            if cfg.semantic_loss:
+                semantics_gt = data["semantics"].to(device)  # [1, H, W]
 
             height, width = pixels.shape[1:3]
 
@@ -897,6 +1032,20 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
+            # 3D guard mask needs a depth render (for the reference render depth)
+            # and the GT instance mask routed into the backward pass. Apply a
+            # warmup so the guard only engages after geometry/semantics settle.
+            guard_active = (
+                cfg.guard_mask
+                and cfg.semantic_loss
+                and step >= cfg.guard_warmup
+            )
+            if cfg.depth_loss or guard_active:
+                render_mode = "RGB+ED"
+            else:
+                render_mode = "RGB"
+            guard_gt_mask = semantics_gt if guard_active else None
+
             # forward
             renders, alphas, info = self.stage.render(
                 self.scene.id,
@@ -908,11 +1057,13 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode=render_mode,
                 masks=masks,
                 frame_idcs=image_ids,
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
+                gt_mask=guard_gt_mask,
+                semantic_codebook=self.codebook if guard_active else None,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -948,24 +1099,57 @@ class Runner:
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                depthloss = depth_l1_loss(
-                    depths, depths_gt, scene_scale=self.scene_scale
+                if "depth_map" in data:
+                    # Dense depth map loss (object_nerf style)
+                    depth_gt = data["depth_map"].to(device)  # [1, H, W]
+                    if depths is not None:
+                        depths_pred = depths.squeeze(-1)  # [1, H, W]
+                        # Create valid mask: only compute loss where GT depth > 0
+                        valid_depth_mask = depth_gt > 0
+                        if valid_depth_mask.any():
+                            # Compute L1 loss in disparity space (more robust for depth)
+                            eps = 1e-6
+                            disparity_pred = 1.0 / (depths_pred + eps)
+                            disparity_gt = 1.0 / (depth_gt + eps)
+                            depthloss = torch.abs(disparity_pred[valid_depth_mask] - disparity_gt[valid_depth_mask]).mean()
+                            loss += depthloss * cfg.depth_lambda
+                        else:
+                            depthloss = torch.tensor(0.0, device=device)
+                    else:
+                        depthloss = torch.tensor(0.0, device=device)
+                else:
+                    # Sparse depth points loss (original COLMAP style)
+                    points = data["points"].to(device)  # [1, M, 2]
+                    depths_gt = data["depths"].to(device)  # [1, M]
+                    # query depths from depth map
+                    points = torch.stack(
+                        [
+                            points[:, :, 0] / (width - 1) * 2 - 1,
+                            points[:, :, 1] / (height - 1) * 2 - 1,
+                        ],
+                        dim=-1,
+                    )  # normalize to [-1, 1]
+                    grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                    depths_sampled = F.grid_sample(
+                        depths.permute(0, 3, 1, 2), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    depths_sampled = depths_sampled.squeeze(3).squeeze(1)  # [1, M]
+                    # calculate loss in disparity space
+                    depthloss = depth_l1_loss(
+                        depths_sampled, depths_gt, scene_scale=self.scene_scale
+                    )
+                    loss += depthloss * cfg.depth_lambda
+            if cfg.semantic_loss:
+                # Rendered 2D embedding map I_emb in R^{H x W x emb_dim}.
+                emb_map = info["render_extra_signals"][0]  # [H, W, emb_dim]
+                # Per-pixel class logits: I_emb @ B^T -> [H, W, num_classes].
+                # Softmax + cross entropy is fused inside F.cross_entropy.
+                logits = emb_map @ self.codebook.t()  # [H, W, num_classes]
+                semloss = F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    semantics_gt[0].reshape(-1),
                 )
-                loss += depthloss * cfg.depth_lambda
+                loss += semloss * cfg.semantic_lambda
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids
@@ -988,6 +1172,8 @@ class Runner:
             desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if cfg.semantic_loss:
+                desc += f"sem loss={semloss.item():.4f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -1012,6 +1198,8 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if cfg.semantic_loss:
+                    self.writer.add_scalar("train/semloss", semloss.item(), step)
                 if cfg.post_processing is not None:
                     self.writer.add_scalar(
                         "train/post_processing_reg_loss",
@@ -1053,6 +1241,8 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                if cfg.semantic_loss:
+                    data["codebook"] = self.codebook.detach().cpu()
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
                 torch.save(
@@ -1128,6 +1318,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.semantic_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.post_processing_optimizers:
@@ -1208,7 +1401,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.stage.render(
+            colors, _, info = self.stage.render(
                 self.scene.id,
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -1227,6 +1420,10 @@ class Runner:
 
             colors = torch.clamp(colors, 0.0, 1.0)
             canvas_list = [pixels, colors]
+            if cfg.semantic_loss and "render_extra_signals" in info:
+                # Colorized most-likely instance id (argmax of softmax).
+                sem_vis = self._semantic_colorize(info["render_extra_signals"][0])
+                canvas_list.append(sem_vis.unsqueeze(0))
 
             if world_rank == 0:
                 # write images
@@ -1339,7 +1536,7 @@ class Runner:
             camtoworlds = camtoworlds_all[i : i + 1]
             Ks = K[None]
 
-            renders, _, _ = self.stage.render(
+            renders, _, info = self.stage.render(
                 self.scene.id,
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -1354,6 +1551,10 @@ class Runner:
             depths = renders[..., 3:4]  # [1, H, W, 1]
             depths = (depths - depths.min()) / (depths.max() - depths.min())
             canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
+            if cfg.semantic_loss and "render_extra_signals" in info:
+                # Colorized most-likely instance id (argmax of softmax).
+                sem_vis = self._semantic_colorize(info["render_extra_signals"][0])
+                canvas_list.append(sem_vis.unsqueeze(0))
 
             # write images
             canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()

@@ -849,6 +849,11 @@ def rasterize_to_pixels(
     masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
     packed: bool = False,
     absgrad: bool = False,
+    # 3D guard mask (all must be provided to activate)
+    gaussian_depths: Optional[Tensor] = None,  # [..., N] or [nnz]
+    gt_mask: Optional[Tensor] = None,  # [..., image_height, image_width] int32
+    gaussian_object_ids: Optional[Tensor] = None,  # [..., N] or [nnz] int32
+    depth_channel_index: Optional[int] = None,  # index of depth in `colors`
 ) -> Tuple[Tensor, Tensor]:
     """Rasterizes Gaussians to pixels.
 
@@ -866,6 +871,16 @@ def rasterize_to_pixels(
         masks: Optional tile mask to skip rendering GS to masked tiles. [..., tile_height, tile_width]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+        gaussian_depths: Per-Gaussian camera-space z depth, used by the 3D guard
+            mask in the backward pass. [..., N] or [nnz]. Default: None.
+        gt_mask: Per-pixel ground-truth instance ids for the 3D guard mask.
+            [..., image_height, image_width] int32. Default: None.
+        gaussian_object_ids: Per-Gaussian inferred object ids for the 3D guard mask.
+            The guard only blocks gradients when gaussian_object_ids[i] != gt_mask[pixel],
+            avoiding self-occlusion artifacts. [..., N] or [nnz] int32. Default: None.
+        depth_channel_index: Index of the rendered depth channel within `colors`,
+            required to extract the reference render depth for the guard mask.
+            Default: None.
 
     Returns:
         A tuple:
@@ -964,6 +979,10 @@ def rasterize_to_pixels(
         isect_offsets.contiguous(),
         flatten_ids.contiguous(),
         absgrad,
+        gaussian_depths.contiguous() if gaussian_depths is not None else None,
+        gt_mask.contiguous() if gt_mask is not None else None,
+        gaussian_object_ids.contiguous() if gaussian_object_ids is not None else None,
+        depth_channel_index,
     )
 
     if padded_channels > 0:
@@ -1735,6 +1754,10 @@ class _RasterizeToPixels(torch.autograd.Function):
         isect_offsets: Tensor,  # [..., tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
+        gaussian_depths: Tensor,  # [..., N] or [nnz], Optional (3D guard mask)
+        gt_mask: Tensor,  # [..., H, W] int32, Optional (3D guard mask)
+        gaussian_object_ids: Tensor,  # [..., N] or [nnz] int32, Optional (3D guard)
+        depth_channel_index: Optional[int],  # index of depth channel in colors
     ) -> Tuple[Tensor, Tensor]:
         render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
             "rasterize_to_pixels_3dgs_fwd"
@@ -1752,6 +1775,18 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
         )
 
+        # 3D guard mask: derive the reference per-pixel render depth from the
+        # rendered (accumulated) depth channel, normalized to expected depth.
+        render_depth = None
+        guard_enabled = (
+            gaussian_depths is not None
+            and gt_mask is not None
+            and depth_channel_index is not None
+        )
+        if guard_enabled:
+            render_depth = render_colors[..., depth_channel_index : depth_channel_index + 1]
+            render_depth = (render_depth / render_alphas.clamp(min=1e-10)).contiguous()
+
         ctx.save_for_backward(
             means2d,
             conics,
@@ -1763,6 +1798,10 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            gaussian_depths,
+            render_depth,
+            gt_mask,
+            gaussian_object_ids,
         )
         ctx.width = width
         ctx.height = height
@@ -1790,6 +1829,10 @@ class _RasterizeToPixels(torch.autograd.Function):
             flatten_ids,
             render_alphas,
             last_ids,
+            gaussian_depths,
+            render_depth,
+            gt_mask,
+            gaussian_object_ids,
         ) = ctx.saved_tensors
         width = ctx.width
         height = ctx.height
@@ -1818,6 +1861,10 @@ class _RasterizeToPixels(torch.autograd.Function):
             last_ids,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
+            gaussian_depths,
+            render_depth,
+            gt_mask,
+            gaussian_object_ids,
             absgrad,
         )
 
@@ -1844,6 +1891,10 @@ class _RasterizeToPixels(torch.autograd.Function):
             None,  # isect_offsets
             None,  # flatten_ids
             None,  # absgrad
+            None,  # gaussian_depths
+            None,  # gt_mask
+            None,  # gaussian_object_ids
+            None,  # depth_channel_index
         )
 
 

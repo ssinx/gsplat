@@ -308,6 +308,15 @@ def rasterization(
     extra_signals_sh_degree: Optional[
         int
     ] = None,  # Currently only None or 3 is accepted.
+    # 3D guard mask: per-pixel GT instance ids. When provided, the backward pass
+    # suppresses color/feature and opacity gradients of Gaussians that sit behind
+    # the rendered surface at object pixels. Requires a depth render mode.
+    gt_mask: Optional[Tensor] = None,  # [..., C, H, W] int
+    # Semantic codebook for the 3D guard mask: [num_classes, emb_dim]. When provided
+    # alongside gt_mask, the guard infers each Gaussian's object id via
+    # argmax(extra_signals @ codebook.t()) and only blocks gradients for Gaussians
+    # that do not belong to the pixel's GT object, avoiding self-occlusion artifacts.
+    semantic_codebook: Optional[Tensor] = None,  # [num_classes, emb_dim]
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -638,6 +647,22 @@ def rasterization(
 
     if absgrad:
         assert not distributed, "AbsGrad is not supported in distributed mode."
+
+    # 3D guard mask: only supported on the classic (non-eval3d), non-packed,
+    # non-distributed path with a depth render mode, since the guard relies on a
+    # rendered per-pixel depth and per-Gaussian z handed to the bwd kernel.
+    guard_enabled = gt_mask is not None
+    if guard_enabled:
+        if not render_mode_has_depth_channel(render_mode):
+            raise ValueError(
+                "gt_mask (3D guard mask) requires a depth render mode "
+                "(e.g. 'RGB+ED'), so a reference render depth is available."
+            )
+        if with_eval3d or packed or distributed:
+            raise ValueError(
+                "gt_mask (3D guard mask) is only supported with "
+                "with_eval3d=False, packed=False, and distributed=False."
+            )
 
     if (
         radial_coeffs is not None
@@ -1109,6 +1134,12 @@ def rasterization(
     )
 
     # print("rank", world_rank, "Before rasterize_to_pixels")
+    if guard_enabled and proj_features.shape[-1] > channel_chunk:
+        raise ValueError(
+            "gt_mask (3D guard mask) is not supported when the rendered channels "
+            f"({proj_features.shape[-1]}) exceed channel_chunk ({channel_chunk}); "
+            "raise channel_chunk so rasterization runs in a single chunk."
+        )
     if proj_features.shape[-1] > channel_chunk:
         # slice into chunks
         n_chunks = (proj_features.shape[-1] + channel_chunk - 1) // channel_chunk
@@ -1224,6 +1255,28 @@ def rasterization(
         else:
             if rays is not None:
                 raise ValueError("Rays input is only supported with with_eval3d=True")
+            # 3D guard mask args: depth is the last channel of proj_features.
+            guard_depths = depths if guard_enabled else None
+            guard_gt_mask = (
+                gt_mask.reshape(*batch_dims, C, height, width).to(torch.int32)
+                if guard_enabled
+                else None
+            )
+            guard_depth_idx = proj_features.shape[-1] - 1 if guard_enabled else None
+            # Infer each Gaussian's object id via argmax(extra_signals @ codebook.t())
+            # so the guard can skip self-occlusion (only block gradients from Gaussians
+            # that belong to a different object than the pixel's GT).
+            guard_gaussian_obj_ids = None
+            if guard_enabled and semantic_codebook is not None and extra_signals is not None:
+                # extra_signals shape: [..., N, emb_dim] (already normalized by this point)
+                # codebook: [num_classes, emb_dim]
+                # logits: [..., N, num_classes]
+                logits = torch.matmul(
+                    extra_signals, semantic_codebook.t()
+                )  # [..., N, num_classes]
+                guard_gaussian_obj_ids = torch.argmax(logits, dim=-1).to(
+                    torch.int32
+                )  # [..., N]
             render_colors, render_alphas = rasterize_to_pixels(
                 means2d,
                 conics,
@@ -1237,6 +1290,10 @@ def rasterization(
                 backgrounds=backgrounds,
                 packed=packed,
                 absgrad=absgrad,
+                gaussian_depths=guard_depths,
+                gt_mask=guard_gt_mask,
+                gaussian_object_ids=guard_gaussian_obj_ids,
+                depth_channel_index=guard_depth_idx,
             )
 
     if extra_signals is not None:

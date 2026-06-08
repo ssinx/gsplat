@@ -59,6 +59,11 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     const scalar_t
         *__restrict__ render_alphas,      // [..., image_height, image_width, 1]
     const int32_t *__restrict__ last_ids, // [..., image_height, image_width]
+    // 3D guard mask inputs (optional; all nullptr disables the guard)
+    const scalar_t *__restrict__ depths,       // [..., N] or [nnz] per-Gaussian z
+    const scalar_t *__restrict__ render_depth, // [..., image_height, image_width, 1]
+    const int32_t *__restrict__ gt_mask,       // [..., image_height, image_width]
+    const int32_t *__restrict__ gaussian_object_ids, // [..., N] or [nnz]
     // grad outputs
     const scalar_t *__restrict__ v_render_colors, // [..., image_height,
                                                   // image_width, CDIM]
@@ -88,6 +93,14 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     }
     if (masks != nullptr) {
         masks += image_id * tile_height * tile_width;
+    }
+    // 3D guard mask is active only when all four inputs are provided.
+    const bool guard_enabled =
+        (depths != nullptr) && (render_depth != nullptr) && (gt_mask != nullptr) &&
+        (gaussian_object_ids != nullptr);
+    if (guard_enabled) {
+        render_depth += image_id * image_height * image_width;
+        gt_mask += image_id * image_height * image_width;
     }
 
     // when the mask is provided, do nothing and return if
@@ -141,6 +154,15 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
         v_render_c[k] = v_render_colors[pix_id * CDIM + k];
     }
     const float v_render_a = v_render_alphas[pix_id];
+
+    // 3D guard mask per-pixel reference values. Read with bounds safety: only
+    // valid for pixels actually inside the image. `gt_id > 0` marks a protected
+    // foreground/object pixel (0 is background/invalid).
+    const float guard_D_render =
+        (guard_enabled && inside) ? render_depth[pix_id] : 0.f;
+    const int32_t guard_gt_id =
+        (guard_enabled && inside) ? gt_mask[pix_id] : 0;
+    const bool guard_pixel_is_object = guard_enabled && (guard_gt_id > 0);
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing
@@ -259,6 +281,29 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                     v_opacity_local = vis * v_alpha;
                 }
 
+                // 3D Guard Mask: if this pixel is a foreground object pixel,
+                // check whether this Gaussian belongs to a different object.
+                // Only suppress gradients for Gaussians that (1) belong to a
+                // different object than the pixel's GT, and (2) sit behind the
+                // rendered surface (occluded). This avoids self-occlusion artifacts
+                // where a surface's own back-half Gaussians are mistakenly blocked.
+                if (guard_pixel_is_object) {
+                    const int32_t gaussian_obj_id = gaussian_object_ids[id_batch[t]];
+                    // Only apply depth-based blocking if the Gaussian belongs to
+                    // a different object (guard_gt_id is the pixel's GT object id).
+                    if (gaussian_obj_id != guard_gt_id) {
+                        const float epsilon = 0.05f;
+                        const float d_i = depths[id_batch[t]];
+                        const float guard_mask =
+                            (d_i > guard_D_render + epsilon) ? 0.0f : 1.0f;
+#pragma unroll
+                        for (uint32_t k = 0; k < CDIM; ++k) {
+                            v_rgb_local[k] *= guard_mask;
+                        }
+                        v_opacity_local *= guard_mask;
+                    }
+                }
+
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
                     buffer[k] += rgbs_batch[t * CDIM + k] * fac;
@@ -319,6 +364,11 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     // forward outputs
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
     const at::Tensor last_ids,      // [..., image_height, image_width]
+    // 3D guard mask inputs (optional)
+    const at::optional<at::Tensor> depths,       // [..., N] or [nnz]
+    const at::optional<at::Tensor> render_depth, // [..., H, W, 1]
+    const at::optional<at::Tensor> gt_mask,      // [..., H, W]
+    const at::optional<at::Tensor> gaussian_object_ids, // [..., N] or [nnz]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., image_height, image_width, 1]
@@ -388,6 +438,11 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
             flatten_ids.data_ptr<int32_t>(),
             render_alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
+            depths.has_value() ? depths.value().data_ptr<float>() : nullptr,
+            render_depth.has_value() ? render_depth.value().data_ptr<float>()
+                                     : nullptr,
+            gt_mask.has_value() ? gt_mask.value().data_ptr<int32_t>() : nullptr,
+            gaussian_object_ids.has_value() ? gaussian_object_ids.value().data_ptr<int32_t>() : nullptr,
             v_render_colors.data_ptr<float>(),
             v_render_alphas.data_ptr<float>(),
             v_means2d_abs.has_value()
@@ -420,6 +475,10 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
         const at::Tensor flatten_ids,                                          \
         const at::Tensor render_alphas,                                        \
         const at::Tensor last_ids,                                             \
+        const at::optional<at::Tensor> depths,                                 \
+        const at::optional<at::Tensor> render_depth,                           \
+        const at::optional<at::Tensor> gt_mask,                                \
+        const at::optional<at::Tensor> gaussian_object_ids,                    \
         const at::Tensor v_render_colors,                                      \
         const at::Tensor v_render_alphas,                                      \
         at::optional<at::Tensor> v_means2d_abs,                                \

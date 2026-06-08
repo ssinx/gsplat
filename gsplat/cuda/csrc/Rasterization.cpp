@@ -140,6 +140,11 @@ rasterize_to_pixels_3dgs_bwd(
     // gradients of outputs
     const at::Tensor &v_render_colors, // [..., image_height, image_width, channels]
     const at::Tensor &v_render_alphas, // [..., image_height, image_width, 1]
+    // 3D guard mask inputs (optional)
+    const at::optional<at::Tensor> &depths,       // [..., N] or [nnz]
+    const at::optional<at::Tensor> &render_depth, // [..., H, W, 1]
+    const at::optional<at::Tensor> &gt_mask,      // [..., H, W]
+    const at::optional<at::Tensor> &gaussian_object_ids, // [..., N] or [nnz]
     // options
     bool absgrad
 ) {
@@ -159,6 +164,18 @@ rasterize_to_pixels_3dgs_bwd(
     }
     if (masks.has_value()) {
         CHECK_INPUT(masks.value());
+    }
+    if (depths.has_value()) {
+        CHECK_INPUT(depths.value());
+    }
+    if (render_depth.has_value()) {
+        CHECK_INPUT(render_depth.value());
+    }
+    if (gt_mask.has_value()) {
+        CHECK_INPUT(gt_mask.value());
+    }
+    if (gaussian_object_ids.has_value()) {
+        CHECK_INPUT(gaussian_object_ids.value());
     }
 
     uint32_t channels = colors.size(-1);
@@ -188,6 +205,10 @@ rasterize_to_pixels_3dgs_bwd(
             flatten_ids,                                                       \
             render_alphas,                                                     \
             last_ids,                                                          \
+            depths,                                                            \
+            render_depth,                                                      \
+            gt_mask,                                                           \
+            gaussian_object_ids,                                               \
             v_render_colors,                                                   \
             v_render_alphas,                                                   \
             absgrad ? c10::optional<at::Tensor>(v_means2d_abs) : c10::nullopt, \

@@ -410,19 +410,66 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        load_semantics: bool = False,
+        depth_max: float = 4.0,  # Maximum valid depth in meters
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.load_semantics = load_semantics
+        self.depth_max = depth_max  # Filter out depths beyond this value
         indices = np.arange(len(self.parser.image_names))
+        # Use a single hand-picked image ("331.png") as the only validation view;
+        # everything else is used for training.
+        val_basenames = {"331.png"}
+        is_val = np.array(
+            [
+                os.path.basename(name) in val_basenames
+                for name in self.parser.image_names
+            ]
+        )
         if split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
+            self.indices = indices[~is_val]
         else:
-            self.indices = indices[indices % self.parser.test_every == 0]
+            self.indices = indices[is_val]
 
     def __len__(self):
         return len(self.indices)
+
+    @staticmethod
+    def _semantics_path(image_path: str) -> str:
+        """Derive the instance-label image path from an RGB image path.
+
+        ``.../images/0.png`` -> ``.../semantics/0.instance-filt.png``
+        """
+        image_dir = os.path.dirname(image_path)
+        parent = os.path.dirname(image_dir)
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        return os.path.join(parent, "semantics", f"{stem}.instance-filt.png")
+
+    def _load_sparse_depths(self, data, camtoworlds, K, image, index):
+        """Load sparse depth points from COLMAP 3D points (fallback method)."""
+        worldtocams = np.linalg.inv(camtoworlds)
+        image_name = self.parser.image_names[index]
+        point_indices = self.parser.point_indices[image_name]
+        points_world = self.parser.points[point_indices]
+        points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
+        points_proj = (K @ points_cam.T).T
+        points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
+        depths = points_cam[:, 2]  # (M,)
+        # filter out points outside the image
+        selector = (
+            (points[:, 0] >= 0)
+            & (points[:, 0] < image.shape[1])
+            & (points[:, 1] >= 0)
+            & (points[:, 1] < image.shape[0])
+            & (depths > 0)
+        )
+        points = points[selector]
+        depths = depths[selector]
+        data["points"] = torch.from_numpy(points).float()
+        data["depths"] = torch.from_numpy(depths).float()
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
@@ -433,6 +480,22 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
 
+        # Load the per-pixel instance-id map aligned to the RGB image. GT semantics
+        # are stored at full resolution as single-channel integer images, so we read
+        # them with IMREAD_ANYDEPTH (preserve integer labels) and resize with nearest
+        # neighbor to the RGB resolution before applying the same geometric ops.
+        semantics = None
+        if self.load_semantics:
+            sem_path = self._semantics_path(self.parser.image_paths[index])
+            sem = cv2.imread(sem_path, cv2.IMREAD_ANYDEPTH)
+            if sem is None:
+                raise FileNotFoundError(f"Semantic label image not found: {sem_path}")
+            semantics = cv2.resize(
+                sem,
+                (image.shape[1], image.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
         if len(params) > 0:
             # Images are distorted. Undistort them.
             mapx, mapy = (
@@ -442,6 +505,9 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+            if semantics is not None:
+                semantics = cv2.remap(semantics, mapx, mapy, cv2.INTER_NEAREST)
+                semantics = semantics[y : y + h, x : x + w]
 
         if self.patch_size is not None:
             # Random crop.
@@ -451,6 +517,10 @@ class Dataset:
             image = image[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
+            if semantics is not None:
+                semantics = semantics[
+                    y : y + self.patch_size, x : x + self.patch_size
+                ]
 
         data = {
             "K": torch.from_numpy(K).float(),
@@ -463,6 +533,10 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+        if semantics is not None:
+            data["semantics"] = torch.from_numpy(
+                semantics.astype(np.int64)
+            )  # [H, W] integer instance ids
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]
@@ -470,27 +544,94 @@ class Dataset:
             data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
 
         if self.load_depths:
-            # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
+            # Try to load dense depth map first (object_nerf/ScanNet style)
+            image_path = self.parser.image_paths[index]
             image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
-            points_world = self.parser.points[point_indices]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
-            points_proj = (K @ points_cam.T).T
-            points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
-            depths = points_cam[:, 2]  # (M,)
-            # filter out points outside the image
-            selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
-            )
-            points = points[selector]
-            depths = depths[selector]
-            data["points"] = torch.from_numpy(points).float()
-            data["depths"] = torch.from_numpy(depths).float()
+            image_basename = os.path.basename(image_name)
+            image_stem = os.path.splitext(image_basename)[0]
+
+            # Try multiple depth file locations
+            depth_path_candidates = [
+                # ScanNet style: depths/{frame_id}.depth.png
+                os.path.join(self.parser.data_dir, "depths", f"{image_stem}.depth.png"),
+                # Alternative: depths directory parallel to images
+                image_path.replace("/images/", "/depths/").replace(image_basename, f"{image_stem}.depth.png"),
+                # Inline style: same directory as image with .depth.png suffix
+                image_path.replace(".png", ".depth.png").replace(".jpg", ".depth.png"),
+            ]
+
+            depth_map_loaded = False
+            for depth_path in depth_path_candidates:
+                if os.path.exists(depth_path):
+                    # Load dense depth map
+                    depth_map = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
+                    if depth_map is not None:
+                        # Resize to match image resolution
+                        depth_map = cv2.resize(
+                            depth_map, (image.shape[1], image.shape[0]),
+                            interpolation=cv2.INTER_NEAREST
+                        )
+                        # Convert to meters (assume millimeters in file)
+                        depth_map = depth_map.astype(np.float32) * 1e-3
+
+                        # Filter out invalid depths (object_nerf style)
+                        # Remove depths beyond depth_max (default 4.0m for indoor scenes)
+                        depth_map[depth_map > self.depth_max] = 0
+
+                        # Apply undistortion if needed
+                        if len(params) > 0:
+                            mapx, mapy = (
+                                self.parser.mapx_dict[camera_id],
+                                self.parser.mapy_dict[camera_id],
+                            )
+                            depth_map = cv2.remap(depth_map, mapx, mapy, cv2.INTER_NEAREST)
+                            x, y, w, h = self.parser.roi_undist_dict[camera_id]
+                            depth_map = depth_map[y : y + h, x : x + w]
+
+                        # Apply patch crop if needed
+                        if self.patch_size is not None:
+                            depth_map = depth_map[y : y + self.patch_size, x : x + self.patch_size]
+
+                        # Normalize depth by scene scale (object_nerf style)
+                        # The parser already normalizes camera positions by scene_scale,
+                        # so we need to normalize depth accordingly
+                        depth_map = depth_map / self.parser.scene_scale
+
+                        # Convert camera z-distance to ray depth (object_nerf style)
+                        # Compute ray directions for perspective correction
+                        h_img, w_img = depth_map.shape
+                        fx = K[0, 0]
+                        fy = K[1, 1]
+                        cx = K[0, 2]
+                        cy = K[1, 2]
+
+                        # Create pixel grid
+                        y_coords, x_coords = np.meshgrid(
+                            np.arange(h_img, dtype=np.float32),
+                            np.arange(w_img, dtype=np.float32),
+                            indexing='ij'
+                        )
+
+                        # Compute ray directions (normalized)
+                        x_dirs = (x_coords - cx) / fx
+                        y_dirs = (y_coords - cy) / fy
+                        z_dirs = np.ones_like(x_dirs)
+
+                        # Ray direction norm (distance from camera center to image plane point)
+                        ray_norms = np.sqrt(x_dirs**2 + y_dirs**2 + z_dirs**2)
+
+                        # Convert z-depth to ray depth: multiply by ray norm
+                        # This converts Euclidean distance along camera z-axis to
+                        # distance along the ray direction
+                        depth_map = depth_map * ray_norms
+
+                        data["depth_map"] = torch.from_numpy(depth_map).float()  # (H, W)
+                        depth_map_loaded = True
+                        break
+
+            if not depth_map_loaded:
+                # Fall back to sparse points from COLMAP
+                self._load_sparse_depths(data, camtoworlds, K, image, index)
 
         return data
 
